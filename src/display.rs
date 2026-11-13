@@ -271,13 +271,17 @@ fn clock_face(c: &mut Canvas, day: NaiveDate, now: DateTime<Utc>, agenda: &Agend
     c.centered("noon", cx, cy + 81, 17., false, 64);
     c.centered("6p", cx - 95, cy - 9, 17., false, 30);
     let a = angle(now);
-    c.line(polar(a, 52), polar(a, 78), 3);
-    let tip = polar(a, 81);
-    for i in -5..=5 {
-        c.rect(
-            tip.0 - i32::abs(i) / 2 - 2,
-            tip.1 + i,
-            5 - i32::abs(i) * 3 / 5,
+    let base = polar(a, 74);
+    let tip = polar(a, 83);
+    c.line(polar(a, 52), base, 3);
+    for offset in -5..=5 {
+        let offset = offset as f32;
+        c.line(
+            (
+                base.0 + (a.cos() * offset).round() as i32,
+                base.1 + (a.sin() * offset).round() as i32,
+            ),
+            tip,
             1,
         );
     }
