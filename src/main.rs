@@ -250,7 +250,8 @@ fn serve(addr: SocketAddrV4) -> Result<()> {
                 let payload = if setup {
                     json!({"status":200,"api_key":d.key,"friendly_id":"FOG001","image_url":image,"message":"Dogpatch is ready"})
                 } else {
-                    json!({"status":0,"filename":name,"image_url":image,"refresh_rate":POLL,"reset_firmware":false,"update_firmware":false,"firmware_url":"","special_function":"none"})
+                    // Firmware 1.6.10 otherwise requests a partial refresh for each BMP.
+                    json!({"status":0,"filename":name,"image_url":image,"refresh_rate":POLL,"maximum_compatibility":true,"reset_firmware":false,"update_firmware":false,"firmware_url":"","special_function":"none"})
                 };
                 (200, "application/json", serde_json::to_vec(&payload)?)
             } else {
