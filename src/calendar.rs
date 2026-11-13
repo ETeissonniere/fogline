@@ -135,7 +135,12 @@ fn date_time(value: DatePerhapsTime) -> CalendarResult<DateTime<Tz>> {
         DatePerhapsTime::DateTime(CalendarDateTime::Floating(wall)) => (Los_Angeles, wall),
         DatePerhapsTime::DateTime(CalendarDateTime::Utc(t)) => return Ok(t.with_timezone(&Tz::UTC)),
         DatePerhapsTime::DateTime(CalendarDateTime::WithTimezone { date_time, tzid }) => {
-            let tz = tzid.trim_matches('"').parse().map_err(|_| UNKNOWN_ZONE)?;
+            // The IANA Etc/GMT names use the opposite sign to numeric UTC offsets.
+            let tz = match tzid.trim_matches('"') {
+                "GMT-0800" => chrono_tz::Etc::GMTPlus8,
+                "GMT-0700" => chrono_tz::Etc::GMTPlus7,
+                name => name.parse().map_err(|_| UNKNOWN_ZONE)?,
+            };
             (tz, date_time)
         }
     };
@@ -486,6 +491,40 @@ END:VEVENT";
                 day("2026-11-13T18:00:00Z")
             ]
         );
+    }
+
+    #[test]
+    fn fixed_offset_series_keep_their_utc_hour_across_the_spring_clock_change() {
+        for (zone, utc_hour) in [("GMT-0800", 17), ("GMT-0700", 16)] {
+            let feed = format!(
+                "BEGIN:VEVENT
+UID:series
+DTSTART;TZID={zone}:20260307T090000
+DTEND;TZID={zone}:20260307T093000
+RRULE:FREQ=DAILY;COUNT=4
+EXDATE;TZID={zone}:20260309T090000
+RDATE;TZID={zone}:20260311T090000
+END:VEVENT
+BEGIN:VEVENT
+UID:series
+RECURRENCE-ID;TZID={zone}:20260310T090000
+DTSTART;TZID={zone}:20260310T110000
+DURATION:PT30M
+END:VEVENT"
+            );
+            let events = plans(&feed, "2026-03-07T12:00:00Z");
+            let expected = [
+                (7, utc_hour),
+                (8, utc_hour),
+                (10, utc_hour + 2),
+                (11, utc_hour),
+            ]
+            .map(|(date, hour)| Utc.with_ymd_and_hms(2026, 3, date, hour, 0, 0).unwrap());
+            assert_eq!(events.iter().map(|p| p.start).collect::<Vec<_>>(), expected);
+            assert!(events
+                .iter()
+                .all(|p| p.end - p.start == Duration::minutes(30)));
+        }
     }
 
     #[test]
