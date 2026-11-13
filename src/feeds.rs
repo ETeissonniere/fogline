@@ -1,24 +1,16 @@
-use crate::weather::{self, Weather};
-use chrono::{DateTime, Datelike, NaiveDate, NaiveTime, Utc};
+use chrono::{DateTime, Datelike, NaiveDate, NaiveDateTime, NaiveTime, Utc};
 use chrono_tz::America::Los_Angeles;
 use scraper::{ElementRef, Html, Selector};
+use serde::Deserialize;
 use std::process::Command;
 
 pub const PARKING: &str =
     "https://www.sfmta.com/notices/current-special-event-parking-regulations-schedule";
+const WEATHER: &str = "https://api.open-meteo.com/v1/forecast?latitude=37.758&longitude=-122.388&timezone=America%2FLos_Angeles&current=temperature_2m,wind_speed_10m,weather_code,is_day&daily=temperature_2m_min,temperature_2m_max,precipitation_probability_max,precipitation_sum,sunset&temperature_unit=celsius&wind_speed_unit=ms&precipitation_unit=mm&forecast_days=1&hourly=temperature_2m,precipitation_probability&forecast_hours=12";
 
 fn fetch(url: &str) -> Result<String, String> {
     let output = Command::new("curl")
-        .args([
-            "-fsSL",
-            "--user-agent",
-            "Fogline (https://github.com/ETeissonniere/fogline)",
-            "--max-time",
-            "12",
-            "--proto",
-            "=https",
-            url,
-        ])
+        .args(["-fsSL", "--max-time", "12", "--proto", "=https", url])
         .output()
         .map_err(|e| e.to_string())?;
     if !output.status.success() {
@@ -136,6 +128,109 @@ pub fn parse_schedule(body: &str) -> Result<Schedule, String> {
     })
 }
 
+#[derive(Clone)]
+pub struct Hour {
+    pub time: NaiveDateTime,
+    pub temp: f64,
+    pub rain: f64,
+}
+
+#[derive(Clone)]
+pub struct Weather {
+    pub fetched: DateTime<Utc>,
+    pub code: Option<u8>,
+    pub is_day: Option<bool>,
+    pub temp: f64,
+    pub wind: f64,
+    pub low: f64,
+    pub high: f64,
+    pub rain: f64,
+    pub mm: f64,
+    pub sunset: NaiveTime,
+    pub hours: Vec<Hour>,
+}
+
+impl Weather {
+    pub fn usable_at(&self, now: DateTime<Utc>) -> bool {
+        let age = now - self.fetched;
+        (chrono::Duration::zero()..=chrono::Duration::hours(3)).contains(&age)
+            && self.fetched.with_timezone(&Los_Angeles).date_naive()
+                == now.with_timezone(&Los_Angeles).date_naive()
+    }
+}
+
+fn parse_weather(body: &str, fetched: DateTime<Utc>) -> Result<Weather, String> {
+    #[derive(Deserialize)]
+    struct Current {
+        weather_code: Option<u8>,
+        is_day: Option<u8>,
+        temperature_2m: f64,
+        wind_speed_10m: f64,
+    }
+    #[derive(Deserialize)]
+    struct Daily {
+        time: [NaiveDate; 1],
+        temperature_2m_min: [f64; 1],
+        temperature_2m_max: [f64; 1],
+        precipitation_probability_max: [f64; 1],
+        precipitation_sum: [f64; 1],
+        sunset: [String; 1],
+    }
+    #[derive(Deserialize)]
+    struct Hourly {
+        time: Vec<String>,
+        temperature_2m: Vec<Option<f64>>,
+        precipitation_probability: Vec<Option<f64>>,
+    }
+    #[derive(Deserialize)]
+    struct Forecast {
+        hourly: Option<Hourly>,
+        current: Current,
+        daily: Daily,
+    }
+    let f: Forecast = serde_json::from_str(body).map_err(|e| e.to_string())?;
+    let d = f.daily;
+    if d.time[0] != fetched.with_timezone(&Los_Angeles).date_naive() {
+        return Err("forecast date differs from today".into());
+    }
+    let sunset = NaiveDateTime::parse_from_str(&d.sunset[0], "%Y-%m-%dT%H:%M")
+        .map_err(|e| e.to_string())?
+        .time();
+    Ok(Weather {
+        fetched,
+        code: f.current.weather_code,
+        is_day: match f.current.is_day {
+            Some(0) => Some(false),
+            Some(1) => Some(true),
+            _ => None,
+        },
+        temp: f.current.temperature_2m,
+        wind: f.current.wind_speed_10m,
+        low: d.temperature_2m_min[0],
+        high: d.temperature_2m_max[0],
+        rain: d.precipitation_probability_max[0],
+        mm: d.precipitation_sum[0],
+        sunset,
+        hours: f
+            .hourly
+            .into_iter()
+            .flat_map(|h| {
+                h.time
+                    .into_iter()
+                    .zip(h.temperature_2m)
+                    .zip(h.precipitation_probability)
+                    .filter_map(|((stamp, temp), rain)| {
+                        Some(Hour {
+                            time: NaiveDateTime::parse_from_str(&stamp, "%Y-%m-%dT%H:%M").ok()?,
+                            temp: temp?,
+                            rain: rain?,
+                        })
+                    })
+            })
+            .collect(),
+    })
+}
+
 pub struct Edition {
     pub calendar: crate::calendar::Agenda,
     pub fetched: DateTime<Utc>,
@@ -157,7 +252,12 @@ pub fn refresh() -> Edition {
     }
     let fetched = Utc::now();
     let calendar = std::thread::spawn(move || crate::calendar::refresh(fetched));
-    let weather = std::thread::spawn(move || known("Weather", weather::forecast(fetched, fetch)));
+    let weather = std::thread::spawn(move || {
+        known(
+            "Open-Meteo",
+            fetch(WEATHER).and_then(|s| parse_weather(&s, fetched)),
+        )
+    });
     let schedule = known("SFMTA", fetch(PARKING).and_then(|s| parse_schedule(&s)));
     Edition {
         calendar: calendar
@@ -166,5 +266,39 @@ pub fn refresh() -> Edition {
         fetched,
         schedule,
         weather: weather.join().unwrap_or_default(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use chrono::Duration;
+
+    #[test]
+    fn repeated_outages_preserve_the_original_timestamp_until_expiry() {
+        let mut edition = crate::sample("sample");
+        let original = edition.fetched;
+        for minutes in [15, 45, 180, 181] {
+            let mut next = crate::sample("sample");
+            next.fetched = original + Duration::minutes(minutes);
+            next.weather = None;
+            edition.replace_with(next);
+            assert_eq!(
+                edition.weather.as_ref().map(|w| w.fetched),
+                (minutes <= 180).then_some(original)
+            );
+        }
+        let mut recovery = crate::sample("sample");
+        recovery.fetched = original + Duration::hours(4);
+        recovery.weather.as_mut().unwrap().fetched = recovery.fetched;
+        edition.replace_with(recovery);
+        assert_eq!(edition.weather.unwrap().fetched, edition.fetched);
+    }
+
+    #[test]
+    fn cached_daily_values_expire_at_pacific_midnight() {
+        let mut w = crate::sample("sample").weather.unwrap();
+        w.fetched = "2026-11-14T07:55:00Z".parse().unwrap();
+        assert!(w.usable_at(w.fetched + Duration::minutes(4)));
+        assert!(!w.usable_at(w.fetched + Duration::minutes(5)));
     }
 }

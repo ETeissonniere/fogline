@@ -1,11 +1,10 @@
 mod calendar;
 mod display;
 mod feeds;
-mod weather;
 
 use chrono::{DateTime, Utc};
 use chrono_tz::America::Los_Angeles;
-use feeds::{Edition, Event, Schedule};
+use feeds::{Edition, Event, Hour, Schedule, Weather};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::{
@@ -23,7 +22,6 @@ use std::{
     time::Duration,
 };
 use tiny_http::{Header, Method, Request, Response, Server};
-use weather::{Condition, ForecastDetails, Hour, Weather};
 
 type Result<T> = std::result::Result<T, Box<dyn Error + Send + Sync>>;
 const POLL: u64 = 900;
@@ -69,12 +67,12 @@ fn sample(mode: &str) -> Edition {
         start: "18:00".parse().unwrap(),
         ..event
     });
-    let (condition, rain, mm) = if dry {
-        (Condition::Clear, 0., 0.)
+    let (code, rain, mm) = if dry {
+        (0, 0., 0.)
     } else if busy {
-        (Condition::Rain, 85., 4.8)
+        (61, 85., 4.8)
     } else {
-        (Condition::PartlyCloudy, 30., 0.7)
+        (2, 30., 0.7)
     };
     Edition {
         calendar: calendar::Agenda::Ready(plans),
@@ -86,17 +84,15 @@ fn sample(mode: &str) -> Edition {
         }),
         weather: Some(Weather {
             fetched: now,
-            condition,
+            code: Some(code),
             is_day: Some(true),
             temp: 14.,
-            wind: Some(3.6),
-            details: ForecastDetails::OpenMeteo {
-                low: 11.,
-                high: 17.,
-                rain,
-                mm,
-                sunset: "17:01".parse().unwrap(),
-            },
+            low: 11.,
+            high: 17.,
+            wind: 3.6,
+            rain,
+            mm,
+            sunset: "17:01".parse().unwrap(),
             hours: [
                 (17, 14., 10., 85.),
                 (18, 13., 15., 70.),

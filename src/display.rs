@@ -1,6 +1,5 @@
 use crate::calendar::{Agenda, Plan};
-use crate::feeds::{Edition, Schedule};
-use crate::weather::{Condition, ForecastDetails, Weather};
+use crate::feeds::{Edition, Schedule, Weather};
 use ab_glyph::{point, Font, FontRef, ScaleFont};
 use chrono::{DateTime, Datelike, NaiveDate, NaiveTime, TimeZone, Timelike, Utc};
 use chrono_tz::America::Los_Angeles;
@@ -550,7 +549,36 @@ fn sunset_icon(c: &mut Canvas, x: i32, y: i32) {
     }
 }
 
+#[derive(Clone, Copy, PartialEq)]
+enum Condition {
+    Clear,
+    MostlyClear,
+    PartlyCloudy,
+    Overcast,
+    Fog,
+    Drizzle,
+    Rain,
+    Snow,
+    Storm,
+    Unknown,
+}
+
 impl Condition {
+    fn from_code(code: Option<u8>) -> Self {
+        // Open-Meteo's WMO weather interpretation codes.
+        match code {
+            Some(0) => Self::Clear,
+            Some(1) => Self::MostlyClear,
+            Some(2) => Self::PartlyCloudy,
+            Some(3) => Self::Overcast,
+            Some(45 | 48) => Self::Fog,
+            Some(51 | 53 | 55 | 56 | 57) => Self::Drizzle,
+            Some(61 | 63 | 65 | 66 | 67 | 80..=82) => Self::Rain,
+            Some(71 | 73 | 75 | 77 | 85 | 86) => Self::Snow,
+            Some(95..=97 | 99) => Self::Storm,
+            _ => Self::Unknown,
+        }
+    }
     fn label(self) -> &'static str {
         match self {
             Self::Clear => "Clear sky",
@@ -686,17 +714,14 @@ fn hourly_chart(c: &mut Canvas, w: &Weather, local: chrono::NaiveDateTime) {
         return;
     }
     c.text("Rain chance", 260, 269, 22., true, 137);
-    if let ForecastDetails::OpenMeteo { rain, mm, .. } = w.details {
-        c.text(
-            &format!("Today {rain:.0}% · {mm:.1} mm"),
-            432,
-            271,
-            17.,
-            false,
-            175,
-        );
-    }
-
+    c.text(
+        &format!("Today {:.0}% · {:.1} mm", w.rain, w.mm),
+        432,
+        271,
+        17.,
+        false,
+        175,
+    );
     let peak = points
         .iter()
         .filter_map(|(_, h)| h.map(|h| h.rain))
@@ -739,43 +764,31 @@ fn weather(c: &mut Canvas, w: Option<&Weather>, local: chrono::NaiveDateTime) {
         c.text("Forecast unavailable", 26, 305, 32., true, 650);
         return;
     };
-    let condition = w.condition;
+    let condition = Condition::from_code(w.code);
     c.text(condition.label(), 26, 269, 23., true, 214);
     condition_icon(c, 61, 322, condition, w.is_day);
     c.text(&format!("{:.0} °C", w.temp), 98, 291, 50., true, 145);
+    c.text(
+        &format!("{:.0}–{:.0} °C   ·   {:.1} m/s", w.low, w.high, w.wind),
+        26,
+        362,
+        19.,
+        false,
+        218,
+    );
     c.rect(240, 278, 1, 101);
     hourly_chart(c, w, local);
     c.rect(611, 278, 1, 101);
-    let wind = w.wind.map_or_else(|| "—".into(), |v| format!("{v:.1} m/s"));
-    match w.details {
-        ForecastDetails::OpenMeteo {
-            low, high, sunset, ..
-        } => {
-            c.text(
-                &format!("{low:.0}–{high:.0} °C   ·   {wind}"),
-                26,
-                362,
-                19.,
-                false,
-                218,
-            );
-            sunset_icon(c, 693, 321);
-            c.centered("Sunset", 693, 335, 20., false, 128);
-            c.centered(
-                &sunset.format("%-I:%M %p").to_string(),
-                693,
-                356,
-                27.,
-                true,
-                152,
-            );
-        }
-        ForecastDetails::Nws => {
-            c.text("Hourly forecast", 26, 362, 19., false, 218);
-            c.centered("Wind", 693, 301, 21., false, 128);
-            c.centered(&wind, 693, 331, 30., true, 152);
-        }
-    }
+    sunset_icon(c, 693, 321);
+    c.centered("Sunset", 693, 335, 20., false, 128);
+    c.centered(
+        &w.sunset.format("%-I:%M %p").to_string(),
+        693,
+        356,
+        27.,
+        true,
+        152,
+    );
 }
 
 pub fn render(edition: &Edition, now: DateTime<Utc>, volts: Option<f32>, sample: bool) -> Vec<u8> {
@@ -835,12 +848,7 @@ pub fn render(edition: &Edition, now: DateTime<Utc>, volts: Option<f32>, sample:
         let stamp = w.fetched.with_timezone(&Los_Angeles).format("%-I:%M %p");
         c.text(&format!("Weather as of {stamp}"), 285, 458, 16., false, 290);
     }
-    let sources = match forecast.map(|w| &w.details) {
-        Some(ForecastDetails::OpenMeteo { .. }) => "SFMTA   /   Open-Meteo",
-        Some(ForecastDetails::Nws) => "SFMTA   /   NWS",
-        None => "SFMTA",
-    };
-    c.text(sources, 601, 458, 16., false, 182);
+    c.text("SFMTA   /   Open-Meteo", 601, 458, 16., false, 182);
     c.bmp()
 }
 
