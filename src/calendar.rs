@@ -5,7 +5,7 @@ use icalendar::{
     UnvalidatedRRule,
 };
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     env, fs,
     io::Write,
     process::{Command, Stdio},
@@ -21,7 +21,14 @@ pub enum Agenda {
 #[derive(Clone, Debug, Default)]
 pub struct CalendarPlans {
     pub events: Vec<Plan>,
-    pub unsupported_rules: usize,
+    unsupported_rules: usize,
+    unsupported_zones: usize,
+}
+
+impl CalendarPlans {
+    pub fn is_partial(&self) -> bool {
+        self.unsupported_rules > 0 || self.unsupported_zones > 0
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -33,6 +40,7 @@ pub struct Plan {
 }
 
 type CalendarResult<T> = Result<T, &'static str>;
+const UNKNOWN_ZONE: &str = "unsupported calendar time zone";
 
 pub fn refresh(now: DateTime<Utc>) -> Agenda {
     let input = match env::var("FOGLINE_ICS") {
@@ -52,6 +60,12 @@ pub fn refresh(now: DateTime<Utc>) -> Agenda {
                 eprintln!(
                     "Shared calendar: could not expand {} recurrence rule(s)",
                     plans.unsupported_rules
+                );
+            }
+            if plans.unsupported_zones > 0 {
+                eprintln!(
+                    "Shared calendar: unsupported calendar time zone in {} component(s)",
+                    plans.unsupported_zones
                 );
             }
             Agenda::Ready(plans)
@@ -121,10 +135,7 @@ fn date_time(value: DatePerhapsTime) -> CalendarResult<DateTime<Tz>> {
         DatePerhapsTime::DateTime(CalendarDateTime::Floating(wall)) => (Los_Angeles, wall),
         DatePerhapsTime::DateTime(CalendarDateTime::Utc(t)) => return Ok(t.with_timezone(&Tz::UTC)),
         DatePerhapsTime::DateTime(CalendarDateTime::WithTimezone { date_time, tzid }) => {
-            let tz = tzid
-                .trim_matches('"')
-                .parse()
-                .map_err(|_| "unsupported calendar time zone")?;
+            let tz = tzid.trim_matches('"').parse().map_err(|_| UNKNOWN_ZONE)?;
             (tz, date_time)
         }
     };
@@ -222,17 +233,19 @@ fn recurrence_rule(
         .ok()
 }
 
-fn occurrence_set(
+fn event_schedule(
     event: &Event,
-    value: &DatePerhapsTime,
-    start: DateTime<Tz>,
     unsupported_rules: &mut usize,
-) -> CalendarResult<rrule::RRuleSet> {
+) -> CalendarResult<(bool, Duration, rrule::RRuleSet)> {
+    let value = event.get_start().ok_or("missing event start")?;
+    let all_day = matches!(value, DatePerhapsTime::Date(_));
+    let start = date_time(value.clone())?;
+    let duration = event_duration(event, start, all_day)?;
     let tz: rrule::Tz = start.timezone().into();
     let first = start.with_timezone(&tz);
     let mut recurrence = rrule::RRuleSet::new(first).rdate(first);
     if let Some(raw) = event.property_value("RRULE") {
-        if let Some(rule) = recurrence_rule(raw, value, first) {
+        if let Some(rule) = recurrence_rule(raw, &value, first) {
             recurrence = recurrence.rrule(rule);
         } else {
             *unsupported_rules += 1;
@@ -242,7 +255,7 @@ fn occurrence_set(
         recurrence = recurrence.rdate(date);
     }
     recurrence = recurrence.set_exdates(extra_dates(event, "EXDATE")?);
-    Ok(recurrence)
+    Ok((all_day, duration, recurrence))
 }
 
 pub(crate) fn parse_calendar(body: &str, now: DateTime<Utc>) -> CalendarResult<CalendarPlans> {
@@ -260,8 +273,20 @@ pub(crate) fn parse_calendar(body: &str, now: DateTime<Utc>) -> CalendarResult<C
 
     // RECURRENCE-ID refers to the original start, even when this instance was moved.
     let mut components = HashMap::new();
+    let mut uncertain_series = HashSet::new();
+    let mut plans = CalendarPlans::default();
     for event in calendar.events() {
         let uid = event.get_uid().ok_or("missing event UID")?;
+        let original = match event.get_recurrence_id().map(date_time).transpose() {
+            Ok(value) => value.map(|t| t.to_utc()),
+            Err(UNKNOWN_ZONE) => {
+                // Without the original instant we cannot tell which master occurrence was replaced.
+                uncertain_series.insert(uid);
+                plans.unsupported_zones += 1;
+                continue;
+            }
+            Err(reason) => return Err(reason),
+        };
         if event
             .properties()
             .get("RECURRENCE-ID")
@@ -270,11 +295,6 @@ pub(crate) fn parse_calendar(body: &str, now: DateTime<Utc>) -> CalendarResult<C
         {
             return Err("unsupported range of modified recurrences");
         }
-        let original = event
-            .get_recurrence_id()
-            .map(date_time)
-            .transpose()?
-            .map(|t| t.to_utc());
         let current: &mut &Event = components.entry((uid, original)).or_insert(event);
         if (event.get_sequence(), event.get_timestamp())
             >= (current.get_sequence(), current.get_timestamp())
@@ -283,21 +303,25 @@ pub(crate) fn parse_calendar(body: &str, now: DateTime<Utc>) -> CalendarResult<C
         }
     }
 
-    let mut plans = CalendarPlans::default();
     for (&(uid, original), &event) in &components {
-        if event.get_status() == Some(EventStatus::Cancelled)
+        if (original.is_none() && uncertain_series.contains(uid))
+            || event.get_status() == Some(EventStatus::Cancelled)
             || components
                 .get(&(uid, None))
                 .is_some_and(|base| base.get_status() == Some(EventStatus::Cancelled))
         {
             continue;
         }
-        let value = event.get_start().ok_or("missing event start")?;
-        let all_day = matches!(value, DatePerhapsTime::Date(_));
-        let start = date_time(value.clone())?;
-        let duration = event_duration(event, start, all_day)?;
-        let recurrence = occurrence_set(event, &value, start, &mut plans.unsupported_rules)?;
-        let tz = start.timezone().into();
+        let (all_day, duration, recurrence) =
+            match event_schedule(event, &mut plans.unsupported_rules) {
+                Ok(schedule) => schedule,
+                Err(UNKNOWN_ZONE) => {
+                    plans.unsupported_zones += 1;
+                    continue;
+                }
+                Err(reason) => return Err(reason),
+            };
+        let tz = recurrence.get_dt_start().timezone();
         // All-day spans use calendar days: their absolute duration can differ by an hour at DST.
         let lookback = duration
             + if all_day {
@@ -363,6 +387,7 @@ mod tests {
     fn plans(data: &str, now: &str) -> Vec<Plan> {
         let calendar = calendar(data, now);
         assert_eq!(calendar.unsupported_rules, 0);
+        assert!(!calendar.is_partial());
         calendar.events
     }
     #[test]
@@ -461,6 +486,66 @@ END:VEVENT";
                 day("2026-11-13T18:00:00Z")
             ]
         );
+    }
+
+    #[test]
+    fn unknown_time_zones_leave_independent_events_visible() {
+        let independent = "BEGIN:VEVENT\nUID:other\nDTSTART:20261110T170000Z\nEND:VEVENT";
+        for dates in [
+            "DTSTART;TZID=Custom/Unknown:20261110T090000",
+            "DTSTART:20261110T180000Z\nDTEND;TZID=Custom/Unknown:20261110T120000",
+            "DTSTART:20261110T180000Z\nEXDATE;TZID=Custom/Unknown:20261110T090000",
+            "DTSTART:20261110T180000Z\nRDATE;TZID=Custom/Unknown:20261111T090000",
+        ] {
+            let bad = format!("BEGIN:VEVENT\nUID:bad\n{dates}\nEND:VEVENT");
+            let result = calendar(&format!("{bad}\n{independent}"), "2026-11-10T12:00:00Z");
+            assert!(result.is_partial());
+            assert_eq!(result.unsupported_zones, 1);
+            assert_eq!(
+                result.events.iter().map(|p| p.start).collect::<Vec<_>>(),
+                [day("2026-11-10T17:00:00Z")]
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_override_zones_never_resurrect_superseded_occurrences() {
+        let base = "BEGIN:VEVENT\nUID:series\nDTSTART:20261110T180000Z\nRRULE:FREQ=DAILY;COUNT=3\nEND:VEVENT";
+        let moved = "BEGIN:VEVENT\nUID:series\nRECURRENCE-ID:20261111T180000Z\nDTSTART:20261111T190000Z\nEND:VEVENT";
+        let independent = "BEGIN:VEVENT\nUID:other\nDTSTART:20261110T170000Z\nEND:VEVENT";
+        for (change, final_base_is_known) in [
+            (
+                "RECURRENCE-ID:20261110T180000Z\nDTSTART;TZID=Custom/Unknown:20261110T120000",
+                true,
+            ),
+            (
+                "RECURRENCE-ID;TZID=Custom/Unknown:20261110T090000\nSTATUS:CANCELLED",
+                false,
+            ),
+        ] {
+            for before_master in [true, false] {
+                let change = format!("BEGIN:VEVENT\nUID:series\n{change}\nEND:VEVENT");
+                let feed = if before_master {
+                    format!("{change}\n{base}")
+                } else {
+                    format!("{base}\n{change}")
+                };
+                let result = calendar(
+                    &format!("{feed}\n{moved}\n{independent}"),
+                    "2026-11-10T12:00:00Z",
+                );
+                assert!(result.is_partial());
+                assert_eq!(result.unsupported_zones, 1);
+                let mut expected = vec![day("2026-11-10T17:00:00Z"), day("2026-11-11T19:00:00Z")];
+                if final_base_is_known {
+                    expected.push(day("2026-11-12T18:00:00Z"));
+                }
+                assert_eq!(
+                    result.events.iter().map(|p| p.start).collect::<Vec<_>>(),
+                    expected
+                );
+            }
+        }
     }
 
     #[test]

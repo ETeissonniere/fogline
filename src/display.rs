@@ -406,7 +406,7 @@ fn agenda(c: &mut Canvas, state: &Agenda, now: DateTime<Utc>) {
                     time_label(p, day)
                 });
                 (status, p.title.as_str())
-            } else if plans.unsupported_rules > 0 {
+            } else if plans.is_partial() {
                 ("SHARED CALENDAR", "Schedule incomplete")
             } else {
                 quiet = true;
@@ -427,7 +427,7 @@ fn agenda(c: &mut Canvas, state: &Agenda, now: DateTime<Utc>) {
         }
     };
     c.text(eyebrow, 258, 68, 17., false, 516);
-    if time.is_some() && matches!(state, Agenda::Ready(p) if p.unsupported_rules > 0) {
+    if time.is_some() && matches!(state, Agenda::Ready(p) if p.is_partial()) {
         c.text("Partial calendar", 634, 68, 17., false, 140);
     }
     if let Some(t) = time.as_deref() {
