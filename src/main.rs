@@ -46,7 +46,7 @@ fn sample(mode: &str) -> Edition {
         include_str!("../examples/household.ics")
     };
     let plans = if mode == "sample-quiet" {
-        Vec::new()
+        calendar::CalendarPlans::default()
     } else {
         calendar::parse_calendar(fixture, now).expect("invalid built-in sample calendar")
     };

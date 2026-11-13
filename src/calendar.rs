@@ -1,4 +1,4 @@
-use chrono::{DateTime, Days, Duration, NaiveDate, NaiveTime, TimeZone, Utc};
+use chrono::{DateTime, Days, Duration, NaiveDate, NaiveDateTime, NaiveTime, TimeZone, Utc};
 use chrono_tz::{America::Los_Angeles, Tz};
 use icalendar::{
     rrule, Calendar, CalendarDateTime, Component, DatePerhapsTime, Event, EventStatus, Property,
@@ -15,7 +15,13 @@ use std::{
 pub enum Agenda {
     NotConfigured,
     Unavailable,
-    Ready(Vec<Plan>),
+    Ready(CalendarPlans),
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct CalendarPlans {
+    pub events: Vec<Plan>,
+    pub unsupported_rules: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -41,7 +47,15 @@ pub fn refresh(now: DateTime<Utc>) -> Agenda {
         Err(_) => Err("invalid calendar source"),
     };
     match input.and_then(|body| parse_calendar(&body, now)) {
-        Ok(plans) => Agenda::Ready(plans),
+        Ok(plans) => {
+            if plans.unsupported_rules > 0 {
+                eprintln!(
+                    "Shared calendar: could not expand {} recurrence rule(s)",
+                    plans.unsupported_rules
+                );
+            }
+            Agenda::Ready(plans)
+        }
         Err(reason) => {
             eprintln!("Shared calendar: {reason}");
             Agenda::Unavailable
@@ -169,16 +183,60 @@ fn event_duration(event: &Event, start: DateTime<Tz>, all_day: bool) -> Calendar
     Ok(duration)
 }
 
-fn occurrence_set(event: &Event, start: DateTime<Tz>) -> CalendarResult<rrule::RRuleSet> {
+fn recurrence_rule(
+    raw: &str,
+    start: &DatePerhapsTime,
+    first: DateTime<rrule::Tz>,
+) -> Option<rrule::RRule> {
+    // rrule parses an unqualified UNTIL in the server's timezone. Resolve it in
+    // the same household timezone as a DATE or floating DTSTART before validation.
+    let mut fields = Vec::new();
+    for field in raw.split(';') {
+        if let Some((key, value)) = field.split_once('=') {
+            if key.eq_ignore_ascii_case("UNTIL") && !value.ends_with('Z') {
+                let wall = match start {
+                    DatePerhapsTime::Date(_) => Some(
+                        NaiveDate::parse_from_str(value, "%Y%m%d")
+                            .ok()?
+                            .and_time(NaiveTime::MIN),
+                    ),
+                    DatePerhapsTime::DateTime(CalendarDateTime::Floating(_)) => {
+                        Some(NaiveDateTime::parse_from_str(value, "%Y%m%dT%H%M%S").ok()?)
+                    }
+                    _ => None,
+                };
+                if let Some(wall) = wall {
+                    let until = Los_Angeles.from_local_datetime(&wall).earliest()?.to_utc();
+                    fields.push(format!("UNTIL={}", until.format("%Y%m%dT%H%M%SZ")));
+                    continue;
+                }
+            }
+        }
+        fields.push(field.to_owned());
+    }
+    fields
+        .join(";")
+        .parse::<UnvalidatedRRule>()
+        .ok()?
+        .validate(first)
+        .ok()
+}
+
+fn occurrence_set(
+    event: &Event,
+    value: &DatePerhapsTime,
+    start: DateTime<Tz>,
+    unsupported_rules: &mut usize,
+) -> CalendarResult<rrule::RRuleSet> {
     let tz: rrule::Tz = start.timezone().into();
     let first = start.with_timezone(&tz);
     let mut recurrence = rrule::RRuleSet::new(first).rdate(first);
     if let Some(raw) = event.property_value("RRULE") {
-        let rule = raw
-            .parse::<UnvalidatedRRule>()
-            .and_then(|r| r.validate(first))
-            .map_err(|_| "unsupported recurrence rule")?;
-        recurrence = recurrence.rrule(rule);
+        if let Some(rule) = recurrence_rule(raw, value, first) {
+            recurrence = recurrence.rrule(rule);
+        } else {
+            *unsupported_rules += 1;
+        }
     }
     for date in extra_dates(event, "RDATE")? {
         recurrence = recurrence.rdate(date);
@@ -187,7 +245,7 @@ fn occurrence_set(event: &Event, start: DateTime<Tz>) -> CalendarResult<rrule::R
     Ok(recurrence)
 }
 
-pub(crate) fn parse_calendar(body: &str, now: DateTime<Utc>) -> CalendarResult<Vec<Plan>> {
+pub(crate) fn parse_calendar(body: &str, now: DateTime<Utc>) -> CalendarResult<CalendarPlans> {
     let body = body.trim().trim_start_matches('\u{feff}');
     if !body.starts_with("BEGIN:VCALENDAR") || !body.ends_with("END:VCALENDAR") {
         return Err("expected a complete iCalendar file");
@@ -225,7 +283,7 @@ pub(crate) fn parse_calendar(body: &str, now: DateTime<Utc>) -> CalendarResult<V
         }
     }
 
-    let mut plans = Vec::new();
+    let mut plans = CalendarPlans::default();
     for (&(uid, original), &event) in &components {
         if event.get_status() == Some(EventStatus::Cancelled)
             || components
@@ -236,9 +294,9 @@ pub(crate) fn parse_calendar(body: &str, now: DateTime<Utc>) -> CalendarResult<V
         }
         let value = event.get_start().ok_or("missing event start")?;
         let all_day = matches!(value, DatePerhapsTime::Date(_));
-        let start = date_time(value)?;
+        let start = date_time(value.clone())?;
         let duration = event_duration(event, start, all_day)?;
-        let recurrence = occurrence_set(event, start)?;
+        let recurrence = occurrence_set(event, &value, start, &mut plans.unsupported_rules)?;
         let tz = start.timezone().into();
         // All-day spans use calendar days: their absolute duration can differ by an hour at DST.
         let lookback = duration
@@ -273,7 +331,7 @@ pub(crate) fn parse_calendar(body: &str, now: DateTime<Utc>) -> CalendarResult<V
                     .split_whitespace()
                     .collect::<Vec<_>>()
                     .join(" ");
-                plans.push(Plan {
+                plans.events.push(Plan {
                     title,
                     start,
                     end,
@@ -282,7 +340,9 @@ pub(crate) fn parse_calendar(body: &str, now: DateTime<Utc>) -> CalendarResult<V
             }
         }
     }
-    plans.sort_by(|a, b| (a.start, a.end, &a.title).cmp(&(b.start, b.end, &b.title)));
+    plans
+        .events
+        .sort_by(|a, b| (a.start, a.end, &a.title).cmp(&(b.start, b.end, &b.title)));
     Ok(plans)
 }
 
@@ -293,12 +353,17 @@ mod tests {
     fn day(s: &str) -> DateTime<Utc> {
         DateTime::parse_from_rfc3339(s).unwrap().to_utc()
     }
-    fn plans(data: &str, now: &str) -> Vec<Plan> {
+    fn calendar(data: &str, now: &str) -> CalendarPlans {
         parse_calendar(
             &format!("BEGIN:VCALENDAR\r\nVERSION:2.0\r\n{data}\r\nEND:VCALENDAR\r\n"),
             day(now),
         )
         .unwrap()
+    }
+    fn plans(data: &str, now: &str) -> Vec<Plan> {
+        let calendar = calendar(data, now);
+        assert_eq!(calendar.unsupported_rules, 0);
+        calendar.events
     }
     #[test]
     fn calendar_exceptions_replace_cancel_and_exclude_original_instances() {
@@ -361,12 +426,51 @@ END:VEVENT";
     }
 
     #[test]
+    fn last_weekday_with_an_inclusive_until_keeps_the_final_occurrence() {
+        for (start, until, expected) in [
+            (";VALUE=DATE:20261030", "20261130", "2026-11-30T08:00:00Z"),
+            (
+                ":20261030T190000",
+                "20261130T190000",
+                "2026-12-01T03:00:00Z",
+            ),
+            (
+                ";TZID=America/Los_Angeles:20261030T190000",
+                "20261201T030000Z",
+                "2026-12-01T03:00:00Z",
+            ),
+        ] {
+            let event = format!("BEGIN:VEVENT\nUID:last-weekday\nDTSTART{start}\nRRULE:FREQ=MONTHLY;BYDAY=MO,TU,WE,TH,FR;BYSETPOS=-1;UNTIL={until}\nEND:VEVENT");
+            let result = plans(&event, "2026-11-29T12:00:00Z");
+            assert_eq!(result.len(), 1);
+            assert_eq!(result[0].start, day(expected));
+            assert!(plans(&event, "2026-12-28T12:00:00Z").is_empty());
+        }
+    }
+
+    #[test]
+    fn an_unsupported_rule_keeps_known_dates_and_unrelated_events() {
+        let events = "BEGIN:VEVENT\nUID:series\nDTSTART:20261110T180000Z\nRRULE:FREQ=DAILY;BYSETPOS=0\nRDATE:20261111T180000Z,20261112T180000Z\nEXDATE:20261111T180000Z\nEND:VEVENT\nBEGIN:VEVENT\nUID:series\nRECURRENCE-ID:20261112T180000Z\nDTSTART:20261112T190000Z\nEND:VEVENT\nBEGIN:VEVENT\nUID:independent\nDTSTART:20261113T180000Z\nEND:VEVENT";
+        let result = calendar(events, "2026-11-10T12:00:00Z");
+        assert_eq!(result.unsupported_rules, 1);
+        assert_eq!(
+            result.events.iter().map(|p| p.start).collect::<Vec<_>>(),
+            [
+                day("2026-11-10T18:00:00Z"),
+                day("2026-11-12T19:00:00Z"),
+                day("2026-11-13T18:00:00Z")
+            ]
+        );
+    }
+
+    #[test]
     fn empty_calendar_and_failed_subscription_are_distinct() {
         let now = day("2026-11-10T00:00:00Z");
         assert!(parse_calendar("<html>Sign in</html>", now).is_err());
         assert!(
             parse_calendar("BEGIN:VCALENDAR\nVERSION:2.0\nEND:VCALENDAR", now)
                 .unwrap()
+                .events
                 .is_empty()
         );
     }

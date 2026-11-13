@@ -245,9 +245,10 @@ fn clock_face(c: &mut Canvas, day: NaiveDate, now: DateTime<Utc>, agenda: &Agend
             if major { 3 } else { 2 },
         );
     }
-    if let Agenda::Ready(events) = agenda {
+    if let Agenda::Ready(plans) = agenda {
         let mut booked_until = day_start;
-        for p in events
+        for p in plans
+            .events
             .iter()
             .filter(|p| !p.all_day && p.start < day_end && p.end.max(p.start) >= day_start)
         {
@@ -375,7 +376,8 @@ fn agenda(c: &mut Canvas, state: &Agenda, now: DateTime<Utc>) {
     let (eyebrow, title) = match state {
         Agenda::NotConfigured => ("SHARED CALENDAR", "Connect your calendar"),
         Agenda::Unavailable => ("SHARED CALENDAR", "Calendar unavailable"),
-        Agenda::Ready(events) => {
+        Agenda::Ready(plans) => {
+            let events = &plans.events;
             if let Some(focus) = agenda_focus(events, now) {
                 let p = focus.primary;
                 more_today = focus.more_today;
@@ -404,6 +406,8 @@ fn agenda(c: &mut Canvas, state: &Agenda, now: DateTime<Utc>) {
                     time_label(p, day)
                 });
                 (status, p.title.as_str())
+            } else if plans.unsupported_rules > 0 {
+                ("SHARED CALENDAR", "Schedule incomplete")
             } else {
                 quiet = true;
                 let ended_today = events.iter().any(|p| {
@@ -423,6 +427,9 @@ fn agenda(c: &mut Canvas, state: &Agenda, now: DateTime<Utc>) {
         }
     };
     c.text(eyebrow, 258, 68, 17., false, 516);
+    if time.is_some() && matches!(state, Agenda::Ready(p) if p.unsupported_rules > 0) {
+        c.text("Partial calendar", 634, 68, 17., false, 140);
+    }
     if let Some(t) = time.as_deref() {
         c.text(t, 256, 88, 38., false, 516);
     }
@@ -869,10 +876,10 @@ mod tests {
     #[test]
     fn busy_day_advances_after_each_appointment_and_counts_only_today() {
         let edition = crate::sample("sample-busy");
-        let Agenda::Ready(events) = edition.calendar else {
+        let Agenda::Ready(plans) = edition.calendar else {
             panic!("expected sample calendar");
         };
-        let focus = agenda_focus(&events, edition.fetched).unwrap();
+        let focus = agenda_focus(&plans.events, edition.fetched).unwrap();
         assert_eq!(focus.primary.title, "Pottery studio");
         assert_eq!(
             focus
@@ -884,7 +891,7 @@ mod tests {
         );
         assert_eq!(focus.more_today, 1);
         let after_studio = edition.fetched + chrono::Duration::minutes(45);
-        let focus = agenda_focus(&events, after_studio).unwrap();
+        let focus = agenda_focus(&plans.events, after_studio).unwrap();
         assert_eq!(focus.primary.title, "Make pasta together");
         assert_eq!(focus.following[0].title, "Movie night");
         assert_eq!(focus.more_today, 0);
