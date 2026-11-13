@@ -1,0 +1,8 @@
+/target/
+/result
+/result-*
+/*.bmp
+/pair.json
+/calendar.ics
+/*.env
+.DS_Store
